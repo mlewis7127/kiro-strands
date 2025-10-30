@@ -7,7 +7,9 @@ A powerful code analysis agent built with the Strands Agents SDK, deployed as an
 - **AWS Lambda**: Python 3.12 function with Strands Agents SDK
 - **Lambda Layer**: Contains all dependencies including Strands Agents SDK and tools
 - **API Gateway REST API**: RESTful interface with CORS support
-- **Amazon Bedrock**: AI model provider for code analysis
+- **Amazon Bedrock**: AI model provider for code analysis (Claude 3.5 Sonnet v2)
+- **S3 Buckets**: Input bucket for code files, output bucket for analysis results
+- **EventBridge**: Triggers Lambda function when files are uploaded to S3
 - **CloudWatch**: Logging and monitoring
 - **CDK**: Infrastructure as Code using TypeScript
 
@@ -43,7 +45,14 @@ A powerful code analysis agent built with the Strands Agents SDK, deployed as an
 
 ### 🔌 Multiple Input Methods
 - **Prompt-based**: Direct code analysis via text prompt
-- **S3-based**: Future support for analyzing code files from S3 buckets
+- **S3-based**: Analyze code files uploaded to S3 buckets
+- **Event-driven**: Automatic analysis triggered by S3 file uploads
+
+### 🚀 Event-Driven Architecture
+- **S3 Integration**: Dedicated input and output S3 buckets
+- **EventBridge**: Automatic triggering when files are uploaded
+- **File Type Support**: Supports 25+ programming languages and file types
+- **Automatic Processing**: No manual intervention required
 
 ### 🌐 REST API Interface
 - **Health Check**: `GET /health` - Service status and health
@@ -119,7 +128,25 @@ npx cdk deploy --require-approval never
 
 ## Usage
 
-After deployment, you'll receive API Gateway endpoints. Use them to interact with the agent:
+After deployment, you can interact with the agent in multiple ways:
+
+### 🔄 Event-Driven S3 Analysis (Recommended)
+
+Simply upload code files to the input S3 bucket and analysis will happen automatically:
+
+```bash
+# Upload a code file for automatic analysis
+aws s3 cp your_code.py s3://code-analysis-input-dev-YOUR_ACCOUNT_ID/
+
+# Check the output bucket for results
+aws s3 ls s3://code-analysis-output-dev-YOUR_ACCOUNT_ID/analysis/
+```
+
+**Supported File Types**: `.py`, `.js`, `.ts`, `.java`, `.cpp`, `.c`, `.cs`, `.php`, `.rb`, `.go`, `.rs`, `.kt`, `.swift`, `.scala`, `.r`, `.sql`, `.sh`, `.yaml`, `.yml`, `.json`, `.xml`, `.html`, `.css`, `.md`, `.txt`
+
+### 🌐 API Gateway Endpoints
+
+Use the REST API endpoints for direct interaction:
 
 ### Health Check
 
@@ -198,12 +225,12 @@ Code analysis endpoint that accepts analysis requests.
 }
 ```
 
-**Option 2: S3-based Analysis (Future)**
+**Option 2: S3-based Analysis**
 ```json
 {
-  "s3_bucket": "your-bucket-name",
+  "s3_bucket": "code-analysis-input-dev-YOUR_ACCOUNT_ID",
   "s3_key": "path/to/code/file.py",
-  "destination_bucket": "output-bucket-name"
+  "destination_bucket": "code-analysis-output-dev-YOUR_ACCOUNT_ID"
 }
 ```
 

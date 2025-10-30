@@ -4,6 +4,9 @@ from typing import Dict, Any
 import json
 import logging
 import time
+import boto3
+import os
+from datetime import datetime
 
 # Configure logging
 logger = logging.getLogger()
@@ -44,10 +47,13 @@ def handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     logger.info(f"Processing code analysis request {request_id}")
     
     try:
-        # Handle different event sources (API Gateway, direct invoke, etc.)
+        # Handle different event sources (API Gateway, EventBridge, direct invoke, etc.)
         if 'httpMethod' in event:
             # API Gateway REST API event
             return handle_api_gateway_event(event, context, start_time)
+        elif 'source' in event and event['source'] == 'eventbridge':
+            # EventBridge S3 event
+            return handle_s3_event(event, context, start_time)
         else:
             # Direct Lambda invoke
             return handle_direct_invoke(event, context, start_time)
@@ -203,8 +209,143 @@ def handle_prompt_analysis(request_data: Dict[str, Any], context, start_time: fl
         else:
             return {'status': 'error', 'message': error_msg}
 
+def handle_s3_event(event: Dict[str, Any], context, start_time: float) -> Dict[str, Any]:
+    """Handle S3 events from EventBridge."""
+    request_id = context.aws_request_id if context else "unknown"
+    
+    logger.info(f"Processing S3 event for request {request_id}")
+    logger.info(f"Event data: {json.dumps(event)}")
+    
+    try:
+        # Extract S3 information from EventBridge event
+        bucket_name = event.get('bucket')
+        object_key = event.get('key')
+        output_bucket = event.get('outputBucket')
+        
+        if not bucket_name or not object_key:
+            error_msg = "Missing bucket name or object key in S3 event"
+            logger.error(error_msg)
+            return {'status': 'error', 'message': error_msg}
+        
+        logger.info(f"Analyzing file: s3://{bucket_name}/{object_key}")
+        
+        # Read the file from S3
+        s3_client = boto3.client('s3')
+        
+        try:
+            response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+            file_content = response['Body'].read().decode('utf-8')
+            file_size = response['ContentLength']
+            
+            logger.info(f"Successfully read file: {object_key} ({file_size} bytes)")
+            
+        except Exception as e:
+            error_msg = f"Failed to read file from S3: {str(e)}"
+            logger.error(error_msg)
+            return {'status': 'error', 'message': error_msg}
+        
+        # Determine file type from extension
+        file_extension = object_key.split('.')[-1].lower() if '.' in object_key else 'unknown'
+        
+        # Create analysis prompt
+        analysis_prompt = f"""
+        Analyze this {file_extension} code file: {object_key}
+        
+        File size: {file_size} bytes
+        
+        Code content:
+        ```{file_extension}
+        {file_content}
+        ```
+        
+        Please provide a comprehensive analysis including:
+        1. Code quality assessment
+        2. Security vulnerabilities
+        3. Performance considerations
+        4. Best practices recommendations
+        5. Specific improvements with code examples
+        """
+        
+        # Create Strands Agent with explicit Bedrock model
+        from strands.models import BedrockModel
+        
+        bedrock_model = BedrockModel(
+            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            temperature=0.3,
+            max_tokens=4000,
+        )
+        
+        code_analysis_agent = Agent(
+            model=bedrock_model,
+            system_prompt=CODE_ANALYSIS_SYSTEM_PROMPT,
+            tools=[http_request],
+        )
+        
+        # Process the analysis
+        logger.info("Starting AI analysis...")
+        response = code_analysis_agent(analysis_prompt)
+        analysis_result = str(response)
+        
+        # Generate output file name
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_key = f"analysis/{object_key.replace('/', '_')}_{timestamp}_analysis.md"
+        
+        # Save analysis result to output bucket
+        if output_bucket:
+            try:
+                s3_client.put_object(
+                    Bucket=output_bucket,
+                    Key=output_key,
+                    Body=analysis_result,
+                    ContentType='text/markdown',
+                    Metadata={
+                        'source-bucket': bucket_name,
+                        'source-key': object_key,
+                        'analysis-timestamp': timestamp,
+                        'file-type': file_extension,
+                        'request-id': request_id
+                    }
+                )
+                logger.info(f"Analysis saved to: s3://{output_bucket}/{output_key}")
+                
+            except Exception as e:
+                logger.error(f"Failed to save analysis to S3: {str(e)}")
+                # Continue processing even if save fails
+        
+        processing_time = time.time() - start_time
+        
+        result = {
+            'status': 'success',
+            'message': 'S3 code analysis completed',
+            'request_id': request_id,
+            'input': {
+                'bucket': bucket_name,
+                'key': object_key,
+                'file_size': file_size,
+                'file_type': file_extension
+            },
+            'output': {
+                'bucket': output_bucket,
+                'key': output_key if output_bucket else None,
+                'analysis_length': len(analysis_result)
+            },
+            'processing_time_seconds': round(processing_time, 3),
+            'analysis_preview': analysis_result[:500] + "..." if len(analysis_result) > 500 else analysis_result
+        }
+        
+        logger.info(f"S3 analysis completed successfully in {processing_time:.2f}s")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in S3 event analysis: {str(e)}")
+        return {
+            'status': 'error',
+            'message': f"S3 analysis failed: {str(e)}",
+            'request_id': request_id
+        }
+
 def handle_s3_analysis(request_data: Dict[str, Any], context, start_time: float, is_api_gateway: bool) -> Dict[str, Any]:
-    """Handle S3-based code analysis (placeholder implementation)."""
+    """Handle S3-based code analysis via API request."""
     request_id = context.aws_request_id if context else "unknown"
     
     # Validate required S3 fields
@@ -217,26 +358,129 @@ def handle_s3_analysis(request_data: Dict[str, Any], context, start_time: float,
             else:
                 return {'status': 'error', 'message': error_msg}
     
-    processing_time = time.time() - start_time
+    bucket_name = request_data['s3_bucket']
+    object_key = request_data['s3_key']
+    output_bucket = request_data.get('destination_bucket') or os.environ.get('OUTPUT_BUCKET_NAME')
     
-    # Placeholder response - actual S3 integration would be implemented here
-    result = {
-        'status': 'accepted',
-        'message': 'S3 code analysis request received',
-        'request_id': request_id,
-        'input': {
-            's3_bucket': request_data['s3_bucket'],
-            's3_key': request_data['s3_key'],
-            'destination_bucket': request_data.get('destination_bucket')
-        },
-        'processing_time_seconds': round(processing_time, 3),
-        'note': 'S3 analysis functionality will be implemented in future versions'
-    }
+    logger.info(f"Processing S3 analysis request for s3://{bucket_name}/{object_key}")
     
-    if is_api_gateway:
-        return create_api_response(200, result)
-    else:
-        return result
+    try:
+        # Read the file from S3
+        s3_client = boto3.client('s3')
+        
+        try:
+            response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+            file_content = response['Body'].read().decode('utf-8')
+            file_size = response['ContentLength']
+            
+        except Exception as e:
+            error_msg = f"Failed to read file from S3: {str(e)}"
+            logger.error(error_msg)
+            if is_api_gateway:
+                return create_api_response(400, {'status': 'error', 'message': error_msg})
+            else:
+                return {'status': 'error', 'message': error_msg}
+        
+        # Determine file type from extension
+        file_extension = object_key.split('.')[-1].lower() if '.' in object_key else 'unknown'
+        
+        # Create analysis prompt
+        analysis_prompt = f"""
+        Analyze this {file_extension} code file: {object_key}
+        
+        File size: {file_size} bytes
+        
+        Code content:
+        ```{file_extension}
+        {file_content}
+        ```
+        
+        Please provide a comprehensive analysis including:
+        1. Code quality assessment
+        2. Security vulnerabilities
+        3. Performance considerations
+        4. Best practices recommendations
+        5. Specific improvements with code examples
+        """
+        
+        # Create Strands Agent with explicit Bedrock model
+        from strands.models import BedrockModel
+        
+        bedrock_model = BedrockModel(
+            model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            temperature=0.3,
+            max_tokens=4000,
+        )
+        
+        code_analysis_agent = Agent(
+            model=bedrock_model,
+            system_prompt=CODE_ANALYSIS_SYSTEM_PROMPT,
+            tools=[http_request],
+        )
+        
+        # Process the analysis
+        response = code_analysis_agent(analysis_prompt)
+        analysis_result = str(response)
+        
+        # Generate output file name
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_key = f"analysis/{object_key.replace('/', '_')}_{timestamp}_analysis.md"
+        
+        # Save analysis result to output bucket if specified
+        if output_bucket:
+            try:
+                s3_client.put_object(
+                    Bucket=output_bucket,
+                    Key=output_key,
+                    Body=analysis_result,
+                    ContentType='text/markdown',
+                    Metadata={
+                        'source-bucket': bucket_name,
+                        'source-key': object_key,
+                        'analysis-timestamp': timestamp,
+                        'file-type': file_extension,
+                        'request-id': request_id
+                    }
+                )
+                logger.info(f"Analysis saved to: s3://{output_bucket}/{output_key}")
+                
+            except Exception as e:
+                logger.error(f"Failed to save analysis to S3: {str(e)}")
+                # Continue processing even if save fails
+        
+        processing_time = time.time() - start_time
+        
+        result = {
+            'status': 'success',
+            'message': 'S3 code analysis completed',
+            'request_id': request_id,
+            'input': {
+                's3_bucket': bucket_name,
+                's3_key': object_key,
+                'file_size': file_size,
+                'file_type': file_extension
+            },
+            'output': {
+                'destination_bucket': output_bucket,
+                'output_key': output_key if output_bucket else None,
+                'analysis_length': len(analysis_result)
+            },
+            'processing_time_seconds': round(processing_time, 3),
+            'analysis': analysis_result
+        }
+        
+        if is_api_gateway:
+            return create_api_response(200, result)
+        else:
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error in S3 analysis: {str(e)}")
+        error_msg = f"S3 analysis failed: {str(e)}"
+        if is_api_gateway:
+            return create_api_response(500, {'status': 'error', 'message': error_msg})
+        else:
+            return {'status': 'error', 'message': error_msg}
 
 def create_api_response(status_code: int, data: Dict[str, Any]) -> Dict[str, Any]:
     """Create a standardized HTTP response for API Gateway."""
